@@ -1,0 +1,207 @@
+{
+  "name": "Competitor page changes",
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Setup\nEdit Pages with approved public URLs. Manual runs preview the output. Publish the workflow to retain snapshots between scheduled runs. The first successful run establishes a baseline. The final node returns Markdown; connect a destination if needed. See README for limits.",
+        "height": 220,
+        "width": 540
+      },
+      "id": "setup",
+      "name": "Setup",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        120,
+        -280
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "manual",
+      "name": "Manual run",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 9 * * 1"
+            }
+          ]
+        }
+      },
+      "id": "weekly",
+      "name": "Weekly",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        180
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "/** Text snapshots and line changes. Shared by the CLI and the n8n Code node. */\nconst EXTRACTOR_VERSION = 1;\n\nfunction validatePage(page) {\n  if (!page || typeof page !== 'object' || typeof page.url !== 'string') throw new Error('A page requires a URL');\n  if (/[\\s\\\\\\u0000-\\u001f\\u007f]/.test(page.url)) throw new Error('URL contains whitespace or a control character');\n  const match = /^https:\\/\\/([^/?#]+)([^#]*)(?:#.*)?$/i.exec(page.url);\n  if (!match) throw new Error('Use a public HTTPS URL');\n  const authority = match[1].toLowerCase();\n  const host = authority.replace(/:443$/, '').replace(/\\.$/, '');\n  const labels = host.split('.');\n  if (authority.includes('@') || host.includes(':') || labels.length < 2 || labels.some(label => !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label)) || !/^[a-z]{2,63}$|^xn--[a-z0-9-]+$/.test(labels.at(-1))) throw new Error('Use a public hostname on port 443 without credentials');\n  if (host.endsWith('.local') || host.endsWith('.internal') || host.endsWith('.localhost')) throw new Error('Local hostnames are not supported');\n  const suffix = match[2] || '/';\n  const canonical = 'https://' + host + (suffix.startsWith('?') ? '/' + suffix : suffix);\n  for (const field of ['include', 'ignore']) {\n    if (page[field] !== undefined && (!Array.isArray(page[field]) || page[field].some(s => typeof s !== 'string' || !s.trim()))) throw new Error(field + ' must be an array of non-empty strings');\n  }\n  return {name: String(page.name || host), url: canonical, include: page.include || [], ignore: page.ignore || []};\n}\n\nfunction decodeEntities(text) {\n  const named = {amp: '&', lt: '<', gt: '>', quot: '\"', apos: \"'\", nbsp: ' ', pound: '£', euro: '€', ndash: '-', mdash: '-', rsquo: \"'\", lsquo: \"'\", rdquo: '\"', ldquo: '\"', hellip: '...'};\n  return text.replace(/&(#x[0-9a-f]+|#\\d+|[a-z]+);/gi, (match, token) => {\n    if (token[0] !== '#') return named[token.toLowerCase()] ?? match;\n    const code = token[1].toLowerCase() === 'x' ? parseInt(token.slice(2), 16) : parseInt(token.slice(1), 10);\n    return code > 0 && code <= 0x10ffff && !(code >= 0xd800 && code <= 0xdfff) ? String.fromCodePoint(code) : match;\n  });\n}\n\nfunction extractLines(html, page) {\n  if (typeof html !== 'string' || html.length > 2_000_000) throw new Error('Expected a text response no larger than 2 MB');\n  let text = html.replace(/<!--[\\s\\S]*?-->/g, '');\n  text = text.replace(/<(script|style|noscript|svg)\\b[^>]*>[\\s\\S]*?<\\/\\1\\s*>/gi, '');\n  text = text.replace(/<\\/?(?:p|div|h[1-6]|li|tr|section|article|header|footer|nav|main|br|hr)\\b[^>]*>/gi, '\\n');\n  text = decodeEntities(text.replace(/<[^>]*>/g, ' '));\n  const include = page.include.map(s => s.toLowerCase());\n  const ignore = page.ignore.map(s => s.toLowerCase());\n  const lines = text.split(/\\r?\\n/).map(s => s.replace(/\\s+/g, ' ').trim()).filter(Boolean)\n    .filter(s => (!include.length || include.some(term => s.toLowerCase().includes(term))) && !ignore.some(term => s.toLowerCase().includes(term)));\n  if (!lines.length) throw new Error('No matching text; the previous snapshot was kept');\n  if (lines.length > 5000 || lines.join('\\n').length > 100000) throw new Error('Selected text is too large; narrow the include filters');\n  return lines;\n}\n\nfunction pageKey(page) {\n  return JSON.stringify([EXTRACTOR_VERSION, page.url, [...page.include].sort(), [...page.ignore].sort()]);\n}\n\nfunction lineDiff(before, after) {\n  const subtract = (left, right) => {\n    const counts = new Map();\n    for (const line of right) counts.set(line, (counts.get(line) || 0) + 1);\n    return left.filter(line => { const n = counts.get(line) || 0; if (n) { counts.set(line, n - 1); return false; } return true; });\n  };\n  return {added: subtract(after, before), removed: subtract(before, after)};\n}\n\nfunction comparePage(state, rawPage, html, checkedAt) {\n  const page = validatePage(rawPage);\n  const lines = extractLines(html, page);\n  const key = pageKey(page);\n  const previous = state[key];\n  const diff = previous ? lineDiff(previous.lines, lines) : {added: [], removed: []};\n  const status = !previous ? 'baseline' : diff.added.length || diff.removed.length ? 'changed' : 'unchanged';\n  state[key] = {lines, checkedAt, url: page.url};\n  return {name: page.name, url: page.url, status, checkedAt, previousCheckedAt: previous?.checkedAt || null, ...diff};\n}\n\nfunction digest(results) {\n  const lines = ['# Competitor page changes', ''];\n  for (const result of results) {\n    lines.push('## ' + result.name, result.url, 'Status: ' + result.status, 'Checked: ' + result.checkedAt);\n    if (result.previousCheckedAt) lines.push('Previous snapshot: ' + result.previousCheckedAt);\n    if (result.error) lines.push('Fetch or extraction error: ' + String(result.error).replace(/[\\r\\n]+/g, ' '));\n    if (result.status === 'baseline') lines.push('First successful snapshot. Changes will appear after the next comparison.');\n    for (const [label, values] of [['Added', result.added || []], ['Removed', result.removed || []]]) {\n      if (values.length) { lines.push('', label + ':'); for (const value of values) lines.push('- ' + value.replace(/([\\\\`*_{}\\[\\]<>])/g, '\\\\$1')); }\n    }\n    lines.push('');\n  }\n  lines.push('Changes describe the fetched page text. They do not establish when a commercial policy took effect or why it changed.', '');\n  return lines.join('\\n');\n}\n\nconst pages = [\n  {name: 'Example page', url: 'https://example.com/', include: [], ignore: []},\n];\nif (!pages.length || pages.length > 10) throw new Error('Configure between 1 and 10 public pages');\nconst validated = pages.map(validatePage);\nif (new Set(validated.map(p => p.url)).size !== validated.length) throw new Error('Configure each URL once');\nreturn validated.map(page => ({json: page}));\n"
+      },
+      "id": "pages",
+      "name": "Pages",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $json.url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "competitor-change-monitor/0.1"
+            },
+            {
+              "name": "Accept",
+              "value": "text/html,text/plain"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 20000,
+          "redirect": {
+            "redirect": {
+              "followRedirects": false
+            }
+          },
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 1000
+            }
+          },
+          "response": {
+            "response": {
+              "responseFormat": "text",
+              "outputPropertyName": "body",
+              "fullResponse": true,
+              "neverError": true
+            }
+          }
+        }
+      },
+      "onError": "continueRegularOutput",
+      "id": "fetch",
+      "name": "Fetch page",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        480,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "/** Text snapshots and line changes. Shared by the CLI and the n8n Code node. */\nconst EXTRACTOR_VERSION = 1;\n\nfunction validatePage(page) {\n  if (!page || typeof page !== 'object' || typeof page.url !== 'string') throw new Error('A page requires a URL');\n  if (/[\\s\\\\\\u0000-\\u001f\\u007f]/.test(page.url)) throw new Error('URL contains whitespace or a control character');\n  const match = /^https:\\/\\/([^/?#]+)([^#]*)(?:#.*)?$/i.exec(page.url);\n  if (!match) throw new Error('Use a public HTTPS URL');\n  const authority = match[1].toLowerCase();\n  const host = authority.replace(/:443$/, '').replace(/\\.$/, '');\n  const labels = host.split('.');\n  if (authority.includes('@') || host.includes(':') || labels.length < 2 || labels.some(label => !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label)) || !/^[a-z]{2,63}$|^xn--[a-z0-9-]+$/.test(labels.at(-1))) throw new Error('Use a public hostname on port 443 without credentials');\n  if (host.endsWith('.local') || host.endsWith('.internal') || host.endsWith('.localhost')) throw new Error('Local hostnames are not supported');\n  const suffix = match[2] || '/';\n  const canonical = 'https://' + host + (suffix.startsWith('?') ? '/' + suffix : suffix);\n  for (const field of ['include', 'ignore']) {\n    if (page[field] !== undefined && (!Array.isArray(page[field]) || page[field].some(s => typeof s !== 'string' || !s.trim()))) throw new Error(field + ' must be an array of non-empty strings');\n  }\n  return {name: String(page.name || host), url: canonical, include: page.include || [], ignore: page.ignore || []};\n}\n\nfunction decodeEntities(text) {\n  const named = {amp: '&', lt: '<', gt: '>', quot: '\"', apos: \"'\", nbsp: ' ', pound: '£', euro: '€', ndash: '-', mdash: '-', rsquo: \"'\", lsquo: \"'\", rdquo: '\"', ldquo: '\"', hellip: '...'};\n  return text.replace(/&(#x[0-9a-f]+|#\\d+|[a-z]+);/gi, (match, token) => {\n    if (token[0] !== '#') return named[token.toLowerCase()] ?? match;\n    const code = token[1].toLowerCase() === 'x' ? parseInt(token.slice(2), 16) : parseInt(token.slice(1), 10);\n    return code > 0 && code <= 0x10ffff && !(code >= 0xd800 && code <= 0xdfff) ? String.fromCodePoint(code) : match;\n  });\n}\n\nfunction extractLines(html, page) {\n  if (typeof html !== 'string' || html.length > 2_000_000) throw new Error('Expected a text response no larger than 2 MB');\n  let text = html.replace(/<!--[\\s\\S]*?-->/g, '');\n  text = text.replace(/<(script|style|noscript|svg)\\b[^>]*>[\\s\\S]*?<\\/\\1\\s*>/gi, '');\n  text = text.replace(/<\\/?(?:p|div|h[1-6]|li|tr|section|article|header|footer|nav|main|br|hr)\\b[^>]*>/gi, '\\n');\n  text = decodeEntities(text.replace(/<[^>]*>/g, ' '));\n  const include = page.include.map(s => s.toLowerCase());\n  const ignore = page.ignore.map(s => s.toLowerCase());\n  const lines = text.split(/\\r?\\n/).map(s => s.replace(/\\s+/g, ' ').trim()).filter(Boolean)\n    .filter(s => (!include.length || include.some(term => s.toLowerCase().includes(term))) && !ignore.some(term => s.toLowerCase().includes(term)));\n  if (!lines.length) throw new Error('No matching text; the previous snapshot was kept');\n  if (lines.length > 5000 || lines.join('\\n').length > 100000) throw new Error('Selected text is too large; narrow the include filters');\n  return lines;\n}\n\nfunction pageKey(page) {\n  return JSON.stringify([EXTRACTOR_VERSION, page.url, [...page.include].sort(), [...page.ignore].sort()]);\n}\n\nfunction lineDiff(before, after) {\n  const subtract = (left, right) => {\n    const counts = new Map();\n    for (const line of right) counts.set(line, (counts.get(line) || 0) + 1);\n    return left.filter(line => { const n = counts.get(line) || 0; if (n) { counts.set(line, n - 1); return false; } return true; });\n  };\n  return {added: subtract(after, before), removed: subtract(before, after)};\n}\n\nfunction comparePage(state, rawPage, html, checkedAt) {\n  const page = validatePage(rawPage);\n  const lines = extractLines(html, page);\n  const key = pageKey(page);\n  const previous = state[key];\n  const diff = previous ? lineDiff(previous.lines, lines) : {added: [], removed: []};\n  const status = !previous ? 'baseline' : diff.added.length || diff.removed.length ? 'changed' : 'unchanged';\n  state[key] = {lines, checkedAt, url: page.url};\n  return {name: page.name, url: page.url, status, checkedAt, previousCheckedAt: previous?.checkedAt || null, ...diff};\n}\n\nfunction digest(results) {\n  const lines = ['# Competitor page changes', ''];\n  for (const result of results) {\n    lines.push('## ' + result.name, result.url, 'Status: ' + result.status, 'Checked: ' + result.checkedAt);\n    if (result.previousCheckedAt) lines.push('Previous snapshot: ' + result.previousCheckedAt);\n    if (result.error) lines.push('Fetch or extraction error: ' + String(result.error).replace(/[\\r\\n]+/g, ' '));\n    if (result.status === 'baseline') lines.push('First successful snapshot. Changes will appear after the next comparison.');\n    for (const [label, values] of [['Added', result.added || []], ['Removed', result.removed || []]]) {\n      if (values.length) { lines.push('', label + ':'); for (const value of values) lines.push('- ' + value.replace(/([\\\\`*_{}\\[\\]<>])/g, '\\\\$1')); }\n    }\n    lines.push('');\n  }\n  lines.push('Changes describe the fetched page text. They do not establish when a commercial policy took effect or why it changed.', '');\n  return lines.join('\\n');\n}\n\nconst page = $('Pages').item.json;\nconst response = $json;\nconst checkedAt = new Date().toISOString();\nconst store = $getWorkflowStaticData('global');\nstore.snapshots = store.snapshots || {};\ntry {\n  if (response.error) throw new Error(typeof response.error === 'string' ? response.error : response.error.message || 'Request failed');\n  if (response.statusCode !== 200) throw new Error('HTTP ' + response.statusCode + '; use the final URL for redirects');\n  const type = response.headers?.['content-type'] || '';\n  if (!/^(text\\/html|text\\/plain|application\\/xhtml\\+xml)\\b/i.test(type)) throw new Error('Response is not HTML or plain text');\n  const body = response.body ?? response.data;\n  const lines = extractLines(body, page);\n  if (lines.join('\\n').length > 20000) throw new Error('Selected text exceeds 20 KB; narrow the include filters');\n  return {json: comparePage(store.snapshots, page, body, checkedAt)};\n} catch (error) {\n  return {json: {name: page.name, url: page.url, status: 'error', checkedAt, error: error.message}};\n}\n"
+      },
+      "id": "compare",
+      "name": "Compare snapshots",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        720,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "/** Text snapshots and line changes. Shared by the CLI and the n8n Code node. */\nconst EXTRACTOR_VERSION = 1;\n\nfunction validatePage(page) {\n  if (!page || typeof page !== 'object' || typeof page.url !== 'string') throw new Error('A page requires a URL');\n  if (/[\\s\\\\\\u0000-\\u001f\\u007f]/.test(page.url)) throw new Error('URL contains whitespace or a control character');\n  const match = /^https:\\/\\/([^/?#]+)([^#]*)(?:#.*)?$/i.exec(page.url);\n  if (!match) throw new Error('Use a public HTTPS URL');\n  const authority = match[1].toLowerCase();\n  const host = authority.replace(/:443$/, '').replace(/\\.$/, '');\n  const labels = host.split('.');\n  if (authority.includes('@') || host.includes(':') || labels.length < 2 || labels.some(label => !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label)) || !/^[a-z]{2,63}$|^xn--[a-z0-9-]+$/.test(labels.at(-1))) throw new Error('Use a public hostname on port 443 without credentials');\n  if (host.endsWith('.local') || host.endsWith('.internal') || host.endsWith('.localhost')) throw new Error('Local hostnames are not supported');\n  const suffix = match[2] || '/';\n  const canonical = 'https://' + host + (suffix.startsWith('?') ? '/' + suffix : suffix);\n  for (const field of ['include', 'ignore']) {\n    if (page[field] !== undefined && (!Array.isArray(page[field]) || page[field].some(s => typeof s !== 'string' || !s.trim()))) throw new Error(field + ' must be an array of non-empty strings');\n  }\n  return {name: String(page.name || host), url: canonical, include: page.include || [], ignore: page.ignore || []};\n}\n\nfunction decodeEntities(text) {\n  const named = {amp: '&', lt: '<', gt: '>', quot: '\"', apos: \"'\", nbsp: ' ', pound: '£', euro: '€', ndash: '-', mdash: '-', rsquo: \"'\", lsquo: \"'\", rdquo: '\"', ldquo: '\"', hellip: '...'};\n  return text.replace(/&(#x[0-9a-f]+|#\\d+|[a-z]+);/gi, (match, token) => {\n    if (token[0] !== '#') return named[token.toLowerCase()] ?? match;\n    const code = token[1].toLowerCase() === 'x' ? parseInt(token.slice(2), 16) : parseInt(token.slice(1), 10);\n    return code > 0 && code <= 0x10ffff && !(code >= 0xd800 && code <= 0xdfff) ? String.fromCodePoint(code) : match;\n  });\n}\n\nfunction extractLines(html, page) {\n  if (typeof html !== 'string' || html.length > 2_000_000) throw new Error('Expected a text response no larger than 2 MB');\n  let text = html.replace(/<!--[\\s\\S]*?-->/g, '');\n  text = text.replace(/<(script|style|noscript|svg)\\b[^>]*>[\\s\\S]*?<\\/\\1\\s*>/gi, '');\n  text = text.replace(/<\\/?(?:p|div|h[1-6]|li|tr|section|article|header|footer|nav|main|br|hr)\\b[^>]*>/gi, '\\n');\n  text = decodeEntities(text.replace(/<[^>]*>/g, ' '));\n  const include = page.include.map(s => s.toLowerCase());\n  const ignore = page.ignore.map(s => s.toLowerCase());\n  const lines = text.split(/\\r?\\n/).map(s => s.replace(/\\s+/g, ' ').trim()).filter(Boolean)\n    .filter(s => (!include.length || include.some(term => s.toLowerCase().includes(term))) && !ignore.some(term => s.toLowerCase().includes(term)));\n  if (!lines.length) throw new Error('No matching text; the previous snapshot was kept');\n  if (lines.length > 5000 || lines.join('\\n').length > 100000) throw new Error('Selected text is too large; narrow the include filters');\n  return lines;\n}\n\nfunction pageKey(page) {\n  return JSON.stringify([EXTRACTOR_VERSION, page.url, [...page.include].sort(), [...page.ignore].sort()]);\n}\n\nfunction lineDiff(before, after) {\n  const subtract = (left, right) => {\n    const counts = new Map();\n    for (const line of right) counts.set(line, (counts.get(line) || 0) + 1);\n    return left.filter(line => { const n = counts.get(line) || 0; if (n) { counts.set(line, n - 1); return false; } return true; });\n  };\n  return {added: subtract(after, before), removed: subtract(before, after)};\n}\n\nfunction comparePage(state, rawPage, html, checkedAt) {\n  const page = validatePage(rawPage);\n  const lines = extractLines(html, page);\n  const key = pageKey(page);\n  const previous = state[key];\n  const diff = previous ? lineDiff(previous.lines, lines) : {added: [], removed: []};\n  const status = !previous ? 'baseline' : diff.added.length || diff.removed.length ? 'changed' : 'unchanged';\n  state[key] = {lines, checkedAt, url: page.url};\n  return {name: page.name, url: page.url, status, checkedAt, previousCheckedAt: previous?.checkedAt || null, ...diff};\n}\n\nfunction digest(results) {\n  const lines = ['# Competitor page changes', ''];\n  for (const result of results) {\n    lines.push('## ' + result.name, result.url, 'Status: ' + result.status, 'Checked: ' + result.checkedAt);\n    if (result.previousCheckedAt) lines.push('Previous snapshot: ' + result.previousCheckedAt);\n    if (result.error) lines.push('Fetch or extraction error: ' + String(result.error).replace(/[\\r\\n]+/g, ' '));\n    if (result.status === 'baseline') lines.push('First successful snapshot. Changes will appear after the next comparison.');\n    for (const [label, values] of [['Added', result.added || []], ['Removed', result.removed || []]]) {\n      if (values.length) { lines.push('', label + ':'); for (const value of values) lines.push('- ' + value.replace(/([\\\\`*_{}\\[\\]<>])/g, '\\\\$1')); }\n    }\n    lines.push('');\n  }\n  lines.push('Changes describe the fetched page text. They do not establish when a commercial policy took effect or why it changed.', '');\n  return lines.join('\\n');\n}\n\nconst results = $input.all().map(item => item.json);\nreturn [{json: {markdown: digest(results), changed: results.filter(r => r.status === 'changed').length, errors: results.filter(r => r.status === 'error').length, results}}];\n"
+      },
+      "id": "digest",
+      "name": "Build digest",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        960,
+        0
+      ]
+    }
+  ],
+  "connections": {
+    "Manual run": {
+      "main": [
+        [
+          {
+            "node": "Pages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Weekly": {
+      "main": [
+        [
+          {
+            "node": "Pages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pages": {
+      "main": [
+        [
+          {
+            "node": "Fetch page",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch page": {
+      "main": [
+        [
+          {
+            "node": "Compare snapshots",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compare snapshots": {
+      "main": [
+        [
+          {
+            "node": "Build digest",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "UTC"
+  },
+  "pinData": {},
+  "tags": []
+}

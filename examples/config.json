@@ -1,0 +1,5 @@
+{
+  "pages": [
+    {"name": "Example page", "url": "https://example.com/", "include": [], "ignore": []}
+  ]
+}

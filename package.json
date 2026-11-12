@@ -1,0 +1,14 @@
+{
+  "name": "competitor-change-monitor",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Track text changes on public product and pricing pages.",
+  "type": "module",
+  "scripts": {
+    "test": "node --test",
+    "build:workflow": "node n8n/build-workflow.mjs",
+    "demo": "node examples/demo.mjs"
+  },
+  "engines": {"node": ">=22"},
+  "license": "MIT"
+}
